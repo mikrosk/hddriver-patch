@@ -5,10 +5,9 @@
 #include <stdbool.h>
 #include "endian_utils.h"
 
+#include <mint/osbind.h>
+#define gemdos_cconin() ((void)Cconin())
 
-#define UINT32_MAX 0xFFFFFFFF
-#define INT16_MIN (-32768)
-#define INT16_MAX 32767
 
 #define INST_PATTERN 0x48412281  // swap d1; move.l d1,(a1)
 #define STUB_PATTERN 0x6C847566  // "läuf" <- inject code here
@@ -54,7 +53,7 @@ static inline bool apply_bsr_patch(uint8_t *data, uint32_t site_offset, uint32_t
 
 static void write_patch_stub(uint8_t *data, uint32_t offset) {
     memcpy(&data[offset], patch_stub_code, sizeof(patch_stub_code));
-    printf("Replacement code written at file offset: 0x%lX\r\n", offset);
+    printf("Replacement code written at file offset: 0x%X\r\n", (unsigned int)offset);
 }
 
 static uint32_t find_aligned_pattern(const uint8_t *data, size_t len, uint32_t pattern, int alignment) {

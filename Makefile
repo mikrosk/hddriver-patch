@@ -1,6 +1,9 @@
-CC      = m68k-atari-tos-gnu-gcc
-LD      = m68k-atari-tos-gnu-ld
-CFLAGS  = -std=c99 -Wall -Wextra -O2
+CC      = m68k-atari-mintelf-gcc
+LD      = m68k-atari-mintelf-gcc
+LIBCMINI = $(shell $(CC) -print-sysroot)/opt/libcmini
+CFLAGS  = -std=c99 -Wall -Wextra -O2 -fomit-frame-pointer -I$(LIBCMINI)/include
+LDFLAGS = -nostdlib $(LIBCMINI)/lib/crt0.o -L$(LIBCMINI)/lib -s
+LIBS    = -lcmini -lgcc
 
 OBJS		= main.o endian_utils.o
 
@@ -22,7 +25,7 @@ BREAK_ADDR 	= 0xDA42
 all: $(PRG)
 
 $(PRG): $(OBJS)
-	$(LD) $(LIBS) -o $@ $^
+	$(LD) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(TARGET): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^
