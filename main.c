@@ -9,15 +9,14 @@
 #define gemdos_cconin() ((void)Cconin())
 
 
-#define INST_PATTERN 0x48412281  // swap d1; move.l d1,(a1)
-#define STUB_PATTERN 0x6C847566  // "läuf" <- inject code here
+#define INST_PATTERN 0x484121C1  // swap d1; move.l d1,$ffff8604.w (6 bytes, 12.70+ encoding)
 #define MAX_PATCH_SITES 2
 #define HEADER_SIZE 28
 
 static const uint16_t patch_stub_code[] = {
-    0x3281,             // move.w d1,(a1)
+    0x31C1, 0x8604,     // move.w d1,$ffff8604.w
     0x4841,             // swap d1
-    0x3341, 0x0002,     // move.w d1,2(a1)
+    0x31C1, 0x8606,     // move.w d1,$ffff8606.w
     0x4E75              // rts
 };
 
@@ -53,7 +52,7 @@ static inline bool apply_bsr_patch(uint8_t *data, uint32_t site_offset, uint32_t
 
 static void write_patch_stub(uint8_t *data, uint32_t offset) {
     memcpy(&data[offset], patch_stub_code, sizeof(patch_stub_code));
-    printf("Replacement code written at file offset: 0x%X\r\n", (unsigned int)offset);
+    printf("STE DMA fix, stub written at file offset 0x%X\r\n", (unsigned int)offset);
 }
 
 static uint32_t find_aligned_pattern(const uint8_t *data, size_t len, uint32_t pattern, int alignment) {
@@ -61,31 +60,6 @@ static uint32_t find_aligned_pattern(const uint8_t *data, size_t len, uint32_t p
         if (*(const uint32_t *)&data[i] == pattern)
             return (uint32_t)i;
     }
-    return UINT32_MAX;
-}
-
-uint32_t find_string(const uint8_t *data, size_t size) {
-    const uint8_t prefix = (STUB_PATTERN >> 24) & 0xFF;  // optimization: first byte of pattern
-
-    for (uint32_t i = 0; i <= size - 4; ++i) {
-        if (data[i] != prefix)
-            continue;
-
-        uint32_t val = (data[i] << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3];
-        if (val == STUB_PATTERN) {
-            uint32_t aligned = (i & 1) ? i + 1 : i;
-
-            if (aligned + 8 > size) {
-                printf("site too close to EOF, no room for code\r\n");
-                return UINT32_MAX;
-            }
-
-            printf("Found string pattern at offset 0x%X (aligned: 0x%X)\r\n", (unsigned int)i, (unsigned int)aligned);
-            return aligned;
-        }
-    }
-
-    printf("Target string pattern not found\r\n");
     return UINT32_MAX;
 }
 
@@ -334,30 +308,47 @@ int main(int argc, char **argv)
     if (ide_read_loop == UINT32_MAX)
         printf("IDE copy-loop fix skipped\r\n");
 
+    // STE DMA fix: the stub code goes into the dead bytes the IDE fix
+    // freed inside the read loop
+    bool dma_patched = false;
     uint32_t patch1_offset = find_aligned_pattern(data, insize, INST_PATTERN, 2);
+    uint32_t patch2_offset = UINT32_MAX;
     if (patch1_offset == UINT32_MAX) {
         printf("First occurrence of problematic code not found\r\n");
-        free(data);
-        goto error;
-    }
-
-    uint32_t patch2_offset = find_aligned_pattern(data + patch1_offset + 4,
+    } else {
+        patch2_offset = find_aligned_pattern(data + patch1_offset + 4,
                                               insize - patch1_offset - 4,
                                               INST_PATTERN, 2);
-    if (patch2_offset == UINT32_MAX) {
-        printf("Second occurrence of problematic code not found\r\n");
+        if (patch2_offset == UINT32_MAX)
+            printf("Second occurrence of problematic code not found\r\n");
+    }
+
+    if (patch1_offset != UINT32_MAX && patch2_offset != UINT32_MAX && ide_read_loop != UINT32_MAX) {
+        patch2_offset += patch1_offset + 4;
+
+        uint32_t stub_offset = ide_read_loop + LOOP_DEAD_OFFSET;
+        uint32_t stub_runtime_offset = stub_offset - HEADER_SIZE;
+
+        if (*(const uint16_t *)&data[patch1_offset + 4] != 0x8604 ||
+            *(const uint16_t *)&data[patch2_offset + 4] != 0x8604) {
+            printf("Problematic code does not write to $FFFF8604, refusing to patch\r\n");
+        } else {
+            dma_patched = apply_bsr_patch(data, patch1_offset, stub_runtime_offset, "STE DMA fix, site #1");
+            dma_patched &= apply_bsr_patch(data, patch2_offset, stub_runtime_offset, "STE DMA fix, site #2");
+            // the 6-byte sites leave one word after the bsr.w
+            *(uint16_t *)&data[patch1_offset + 4] = 0x4E71;    // nop
+            *(uint16_t *)&data[patch2_offset + 4] = 0x4E71;
+            write_patch_stub(data, stub_offset);
+        }
+    }
+    if (!dma_patched)
+        printf("STE DMA fix skipped\r\n");
+
+    if (!dma_patched && ide_read_loop == UINT32_MAX) {
+        printf("Nothing patched, no output written\r\n");
         free(data);
         goto error;
     }
-
-    patch2_offset += patch1_offset + 4;
-
-    uint32_t stub_offset = find_string(data, insize);       // file offset
-    uint32_t stub_runtime_offset = stub_offset - HEADER_SIZE;
-
-    apply_bsr_patch(data, patch1_offset, stub_runtime_offset, "#1 move.l -> double move.w");
-    apply_bsr_patch(data, patch2_offset, stub_runtime_offset, "#2 move.l -> double move.w");
-    write_patch_stub(data, stub_offset);
 
     FILE *fout = fopen(argv[2], "wb");
     if (!fout) {
