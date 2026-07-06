@@ -229,7 +229,7 @@ static void patch_ide_loop(uint8_t *data, uint32_t off) {
 }
 
 // returns the read loop's file offset, UINT32_MAX when nothing was patched
-static uint32_t apply_ide_loop_fix(uint8_t *data, size_t size) {
+static uint32_t apply_ide_loop_fix(uint8_t *data, size_t size, uint32_t *write_loop_out) {
     const struct smc_variant *variant = NULL;
 
     uint32_t read_loop = find_ide_loop(data, size, MOVEW_READ_PATTERN, "IDE read loop");
@@ -257,7 +257,100 @@ static uint32_t apply_ide_loop_fix(uint8_t *data, size_t size) {
     patch_ide_loop(data, write_loop);
     memcpy(&data[smc], variant->rep, sizeof(variant->rep));
 
+    *write_loop_out = write_loop;
     return read_loop;
+}
+
+/*
+ * 040/060 cache flush fix.
+ *
+ * The routine called after ACSI/SCSI DMA transfers (5 call sites)
+ * invalidates the caches so the CPU sees the memory the DMA chip wrote
+ * behind their back. It only knows the 020/030 CACR: the or.w #$0808
+ * hits reserved bits on 040/060, nothing is flushed there and stale
+ * cache lines over the DMA buffer survive. Route the routine through
+ * new code in the dead bytes the IDE fix freed inside the write loop:
+ * 'cpusha bc' on 040/060 (the CPU type variable exists since 12.70),
+ * the original CACR code below.
+ */
+
+// move.b <flag>(pc),d2; beq.s <rts>; followed by:
+static const uint16_t flush_tail[] = {
+    0x40E7,             // move.w sr,-(sp)
+    0x007C, 0x0700,     // ori.w #$0700,sr
+    0x4E7A, 0x2002,     // movec cacr,d2
+    0x847C, 0x0808,     // or.w #$0808,d2 (030: clear I+D cache)
+    0x4E7B, 0x2002,     // movec d2,cacr
+    0x46DF,             // move.w (sp)+,sr
+    0x4E75              // rts
+};
+
+static uint32_t find_flush_routine(const uint8_t *data, size_t size) {
+    for (size_t i = 0; i + 6 + sizeof(flush_tail) <= size; i += 2) {
+        const uint16_t *w = (const uint16_t *)&data[i];
+        if (w[0] != 0x143A ||                 // move.b <flag>(pc),d2
+            (w[2] & 0xFF00) != 0x6700 ||      // beq.s
+            memcmp(&w[3], flush_tail, sizeof(flush_tail)) != 0)
+            continue;
+        return (uint32_t)i;
+    }
+
+    printf("Cache flush routine not found\r\n");
+    return UINT32_MAX;
+}
+
+/*
+ * The CPU type variable, located via the 'cpusha bc' dispatch following
+ * the SMC routine:
+ *   12.70/12.71: move.w <cputype>(pc),d0; cmp.w #40,d0; bcs ...
+ *   12.72+:      moveq #39,d0; sub.w <cputype>(pc),d0; bcc ...
+ */
+static uint32_t find_cputype(const uint8_t *data, size_t size) {
+    for (size_t i = 0; i + 12 <= size; i += 2) {
+        const uint16_t *w = (const uint16_t *)&data[i];
+        if (w[0] == 0x303A && w[2] == 0xB07C && w[3] == 0x0028 &&
+            (w[4] & 0xFF00) == 0x6500)
+            return (uint32_t)(i + 2) + *(const int16_t *)&data[i + 2];
+        if (w[0] == 0x7027 && w[1] == 0x907A && (w[3] & 0xFF00) == 0x6400)
+            return (uint32_t)(i + 4) + *(const int16_t *)&data[i + 4];
+    }
+
+    printf("CPU type variable not found\r\n");
+    return UINT32_MAX;
+}
+
+static bool apply_flush_fix(uint8_t *data, size_t size, uint32_t write_loop) {
+    uint32_t flush = find_flush_routine(data, size);
+    uint32_t cputype = find_cputype(data, size);
+    if (flush == UINT32_MAX || cputype == UINT32_MAX)
+        return false;
+
+    uint32_t flag = flush + 2 + *(const int16_t *)&data[flush + 2];
+    uint32_t code = write_loop + LOOP_DEAD_OFFSET;
+    uint16_t *w = (uint16_t *)&data[code];
+
+    w[0] = 0x343A;                                    // move.w <cputype>(pc),d2
+    w[1] = (uint16_t)(cputype - (code + 2));
+    w[2] = 0x0C42;                                    // cmpi.w #40,d2
+    w[3] = 0x0028;
+    w[4] = 0x6504;                                    // bcs.s .old
+    w[5] = 0xF4F8;                                    // cpusha bc
+    w[6] = 0x4E75;                                    // rts
+    w[7] = 0x143A;                                    // .old: move.b <flag>(pc),d2
+    w[8] = (uint16_t)(flag - (code + 16));
+    w[9] = 0x6704;                                    // beq.s .ret
+    w[10] = 0x6000;                                   // bra.w <original CACR code>
+    w[11] = (uint16_t)(flush + 6 - (code + 22));
+    w[12] = 0x4E75;                                   // .ret: rts
+
+    // route the original routine through the new code
+    w = (uint16_t *)&data[flush];
+    w[0] = 0x6000;                                    // bra.w <new code>
+    w[1] = (uint16_t)(code - (flush + 2));
+
+    printf("Cache flush routine patched at file offset 0x%X\r\n", (unsigned int)flush);
+    printf("cpusha dispatch written at file offset 0x%X\r\n", (unsigned int)code);
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -304,7 +397,8 @@ int main(int argc, char **argv)
         goto error;
     }
 
-    uint32_t ide_read_loop = apply_ide_loop_fix(data, insize);
+    uint32_t ide_write_loop = UINT32_MAX;
+    uint32_t ide_read_loop = apply_ide_loop_fix(data, insize, &ide_write_loop);
     if (ide_read_loop == UINT32_MAX)
         printf("IDE copy-loop fix skipped\r\n");
 
@@ -343,6 +437,14 @@ int main(int argc, char **argv)
     }
     if (!dma_patched)
         printf("STE DMA fix skipped\r\n");
+
+    // 040/060 cache flush fix: the dispatch goes into the dead bytes the
+    // IDE fix freed inside the write loop
+    bool flush_patched = false;
+    if (ide_read_loop != UINT32_MAX)
+        flush_patched = apply_flush_fix(data, insize, ide_write_loop);
+    if (!flush_patched)
+        printf("040/060 cache flush fix skipped\r\n");
 
     if (!dma_patched && ide_read_loop == UINT32_MAX) {
         printf("Nothing patched, no output written\r\n");
