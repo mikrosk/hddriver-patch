@@ -355,13 +355,22 @@ static bool apply_flush_fix(uint8_t *data, size_t size, uint32_t write_loop) {
 
 int main(int argc, char **argv)
 {
-    printf("\r\nHDDriver STE DMA fix patcher v0.1\r\n\r\n");
+    printf("\r\nHDDriver STE DMA fix patcher v0.2\r\n\r\n");
     printf("    by Carpet Ritz Crumbs\n\r\n\r\n");
     printf("NB! ALPHA LEVEL SOFTWARE \r\nBACK YOUR FILES UP BEFORE USE!\r\n\r\n");
     printf("   Educational use only.\r\n\r\n");
 
-    if (argc != 3) {
-        printf("\r\nUsage: %s original.sys patched.sys\r\n", argv[0]);
+    if (argc != 2) {
+        printf("\r\nUsage: DMAPATCH.TTP X:\\HDDRIVER.SYS\r\n");
+        printf("(or drag & drop your HDDRIVER.SYS / HDDRIVER.PRG onto this program)\r\n");
+        printf("The original driver is kept as *.BAK\r\n");
+        goto error;
+    }
+
+    size_t len = strlen(argv[1]);
+    if (len < 4 || (stricmp(&argv[1][len - 4], ".sys") != 0 &&
+                    stricmp(&argv[1][len - 4], ".prg") != 0)) {
+        printf("%s is neither a .SYS nor a .PRG file\r\n", argv[1]);
         goto error;
     }
 
@@ -452,18 +461,42 @@ int main(int argc, char **argv)
         goto error;
     }
 
-    FILE *fout = fopen(argv[2], "wb");
-    if (!fout) {
-        printf("Can't open output file: %s\r\n", argv[2]);
+    // backup name: input path with the extension replaced by .BAK
+    char *bakname = malloc(strlen(argv[1]) + 1);
+    if (!bakname) {
+        printf("malloc failed\r\n");
+        free(data);
+        goto error;
+    }
+    strcpy(bakname, argv[1]);
+    strcpy(&bakname[len - 4], ".BAK");
+
+    if (rename(argv[1], bakname) != 0) {
+        printf("Can't rename %s to %s\r\n", argv[1], bakname);
+        printf("(is there a .BAK file from a previous run? delete it first)\r\n");
+        free(bakname);
         free(data);
         goto error;
     }
 
-    fwrite(data, 1, insize, fout);
+    FILE *fout = fopen(argv[1], "wb");
+    if (!fout || fwrite(data, 1, insize, fout) != (size_t)insize) {
+        if (fout) {
+            fclose(fout);
+            remove(argv[1]);                                 // half-written file
+        }
+        rename(bakname, argv[1]);                            // restore the original
+        printf("Can't write %s, original restored\r\n", argv[1]);
+        free(bakname);
+        free(data);
+        goto error;
+    }
     fclose(fout);
     free(data);
 
-    printf("Patched driver written to: %s\r\n", argv[2]);
+    printf("Original driver kept as: %s\r\n", bakname);
+    printf("Patched driver written to: %s\r\n", argv[1]);
+    free(bakname);
     gemdos_cconin();
     return 0;
 

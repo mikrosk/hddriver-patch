@@ -8,9 +8,7 @@ LIBS    = -lcmini -lgcc
 OBJS		= main.o endian_utils.o
 
 TARGET     	= dmapatch
-PRG			= DMAPATCH.PRG
-INPUT      	= ./test/HDDRIVER.ORG
-OUTPUT     	= ./test/HDDRIVER.SYS
+PRG			= DMAPATCH.TTP
 BUILD_DIR  	= build
 
 HD_IMG     	?= hd.img
@@ -29,10 +27,6 @@ $(PRG): $(OBJS)
 
 $(TARGET): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^
-
-$(OUTPUT): $(TARGET) $(INPUT)
-	mkdir -p output
-	./$(TARGET) $(INPUT) $(OUTPUT)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
@@ -67,5 +61,5 @@ deploy:
 
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(DEBUG_SCRIPT) $(OUTPUT) $(PRG)
+	rm -f $(OBJS) $(TARGET) $(DEBUG_SCRIPT) $(PRG)
 
